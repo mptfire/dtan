@@ -4,6 +4,11 @@ on:
     branches:
       - main
 
+# The deploy only needs to read the repo; the Docker Hub credential lives in a
+# separate workflow. Keep the default token read-only.
+permissions:
+  contents: read
+
 concurrency:
   group: nsyte-deploy
   cancel-in-progress: true
@@ -19,7 +24,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Install Dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Build
         run: bun run build
@@ -27,5 +32,37 @@ jobs:
       - name: Setup Deno
         uses: denoland/setup-deno@v1
 
-      - name: Deploy nsyte
-        run: nsyte deploy dist/client --sec ${{ secrets.NBUNK_SECRET }}
+      # The published package (@jsr/nsyte__cli) has no `bin` entry: it ships an
+      # ESM entry at src/cli.js and calls Deno.args/Deno.exit. So `bunx nsyte`
+      # cannot resolve it, and `bun` cannot execute it. `deno run` on the
+      # resolved path is the supported invocation for this version.
+      #
+      # This step deliberately does not publish. nsyte 0.27.4 accepts a signing
+      # key only via `--sec <value>` (argv, visible in the process table) or
+      # `--prompt-sec` (interactive TTY). No environment-variable or
+      # credential-file path exists, so CI cannot publish without exposing the
+      # key. Publishing stays manual, from a TTY.
+      #
+      # `--dry-run` is not a key-free gate either: it builds and signs the site
+      # manifest, so with no key it drops into key management and waits (verified
+      # 2026-11-10). `--version` and `deploy --help` are the checks that load the
+      # whole command graph without a key or a network round trip.
+      - name: Verify nsyte CLI loads from the locked tree
+        run: |
+          set -euo pipefail
+          cli=node_modules/@nsyte/cli/src/cli.js
+          deno run -A --quiet "$cli" --version
+          deno run -A --quiet "$cli" deploy --help > /dev/null
+
+      # Regression guard: a signing key must never be interpolated into a
+      # command line again. Matches only the two real risk shapes — the Actions
+      # secret expression, and a dynamic value passed to --sec — so this block's
+      # own pattern text cannot trigger it. Comment lines are exempt.
+      - name: Assert no signing key reaches a command line
+        run: |
+          set -euo pipefail
+          if grep -rnE '\$\{\{[[:space:]]*secrets\.NBUNK_SECRET|--sec[[:space:]]+["$]' .github/workflows/ \
+              | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'; then
+            echo "::error::a signing key is passed on a command line; see the comment in nsite.yml"
+            exit 1
+          fi
